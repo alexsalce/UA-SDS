@@ -1,0 +1,1349 @@
+---
+title: "MATH 574M Final Project - NBA Player Analysis"
+author: "Alex Salce"
+date: "Fall Semester, 2023"
+output:
+  html_document:
+    theme: cosmo
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r setwd, echo=FALSE, warning=FALSE, message=FALSE}
+# setwd("C:/Users/Alex Salce/OneDrive/Desktop/School/Courses/2023 FALL SDS MS/MATH574M STATISTICAL MACHINE LEARNING/Final Project/MATH574M Final Project SALCE")
+
+setwd("set your working directory here/MATH574M Final Project SALCE")
+```
+
+## Libraries
+
+```{r pkgs, echo=FALSE, warning=FALSE, message=FALSE}
+#visualization and housekeeping libraries
+library(ggplot2)
+library(tidyverse)
+library(knitr)
+library(gt)
+
+#other
+library(beepr)
+
+#data analysis libraries
+library(MASS)
+library(lubridate)
+library(dplyr)
+library(glmnet)
+library(PredPsych)
+library(reshape2)
+library(leaps)
+library(bestglm)
+```
+
+## Import data
+
+```{r dataimport1, warning=FALSE, tidy=TRUE}
+nbaplayerdata <- data.frame(read.csv('data/nba_api/nbaplayerdatafiltered.csv',header = T))
+
+#get all stat names
+statnames <- colnames(nbaplayerdata)
+
+###############################################################################
+#define stats that i want to use
+player.characteristics.headers <- c("PERSON_ID","DISPLAY_FIRST_LAST","POSITION",
+                                   "HEIGHT","WEIGHT","SEASON_EXP","BIRTHDATE","SCHOOL",
+                                   "COUNTRY","TEAM_NAME","TEAM_ABBREVIATION",
+                                   "FROM_YEAR","TO_YEAR","DRAFT_YEAR","DRAFT_ROUND",
+                                   "DRAFT_NUMBER","GREATEST_75_FLAG")
+game.characteristics.headers <- c("Game_ID_x","SEASON_ID","GAME_DATE","MATCHUP",
+                                 "WL")
+
+player.game.boxscore <- nbaplayerdata[,41:60]
+player.game.hustle <- nbaplayerdata[,63:78]
+player.game.boxscoreadvanced <- nbaplayerdata[,80:101]
+player.game.playertracking <- nbaplayerdata[,102:122]
+
+
+
+#create dataframes of characteristics
+player.characteristics <- nbaplayerdata[player.characteristics.headers]
+game.characteristics <- nbaplayerdata[game.characteristics.headers]
+
+#player game full stats dataframe
+
+player.stats <- data.frame(player.characteristics,game.characteristics,
+                          player.game.boxscore,player.game.boxscoreadvanced,
+                          player.game.hustle,player.game.playertracking)
+
+
+###############################################################################
+#for loop lists
+seasons <- distinct(data.frame(player.stats$SEASON_ID))
+seasons <- data.frame(seasons[order(seasons$player.stats.SEASON_ID, decreasing = TRUE),])
+seasons <- data.frame(seasons[-which(seasons<22017),])
+positions <- distinct(data.frame(player.stats$POSITION))
+
+
+###############################################################################
+#additional data formatting
+
+#convert 'minutes' column to 'seconds
+player.stats$minutes <- period_to_seconds(
+  ms(format(as.POSIXct(parse_date_time(x = player.stats$minutes, 
+                                       c("HMS","MS"))), format = "%M:%S"))) 
+
+###############################################################################
+#REMOVE 
+
+#any rows with no playing time
+player.stats <- player.stats[-which(player.stats$MIN==0),]
+
+#any nans
+player.stats <- na.omit(player.stats)
+colnames(player.stats)[grep("minutes", colnames(player.stats))] <- "seconds"
+
+#redundant data
+stats.redundant.headers <- c("points","assists")
+player.stats <- player.stats[ , -which(names(player.stats) %in% stats.redundant.headers)]
+
+
+#cleanup environment
+rm(player.characteristics,game.characteristics,
+   player.game.boxscore,player.game.boxscoreadvanced,
+   player.game.hustle,player.game.playertracking,nbaplayerdata,statnames,
+   game.characteristics.headers,player.characteristics.headers,statnames,
+   stats.scaleby.time,stats.redundant.headers)
+
+statnames <- colnames(player.stats)
+
+
+###############################################################################
+#stats for manipulation
+#stats for divide by playing time
+
+stats.timenormal.headers <- c("FGM","FGA","FG3M","FG3A","FTM","FTA","OREB",
+                             "DREB","REB","AST","STL","BLK","TOV","PF","PTS",
+                             "PLUS_MINUS","possessions","contestedShots",
+                             "contestedShots2pt","contestedShots3pt",
+                             "deflections","chargesDrawn","screenAssists",
+                             "screenAssistPoints","looseBallsRecoveredOffensive",
+                             "looseBallsRecoveredDefensive",
+                             "looseBallsRecoveredTotal","offensiveBoxOuts",
+                             "defensiveBoxOuts","boxOutPlayerTeamRebounds",
+                             "boxOutPlayerRebounds","boxOuts","distance",
+                             "reboundChancesOffensive","reboundChancesDefensive",
+                             "reboundChancesTotal","touches","secondaryAssists",
+                             "freeThrowAssists","passes",
+                             "contestedFieldGoalsMade",
+                             "contestedFieldGoalsAttempted",
+                             "uncontestedFieldGoalsAttempted",
+                             "defendedAtRimFieldGoalsMade",
+                             "defendedAtRimFieldGoalsAttempted")
+
+stats.scaleby.time <- player.stats[ , which(names(player.stats) %in% stats.timenormal.headers)]
+
+#stats scaled by time
+player.stats.timenormal <- stats.scaleby.time/player.stats[,grep("seconds", colnames(player.stats))]
+
+#cleanup
+rm(stats.scaleby.time)
+
+```
+
+#Functions: Run All "FN" chunks first
+
+### FN: Gen Data
+
+```{r data.fn, warning=FALSE, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+
+
+data.fn <- function(player.stats, player.stats.timenormal, seasons, year,position,binary,threeclass){
+  
+  #filter data by year 
+  stats.player.year <- player.stats[player.stats$SEASON_ID == seasons[(2024-year),],]
+  stats.player.year.timenormal <- player.stats.timenormal[player.stats$SEASON_ID == seasons[(2024-year),],]
+  
+  #select all non-player characteristic data
+  x <- stats.player.year[,24:ncol(stats.player.year)]
+  x.cv <- player.stats[,24:ncol(player.stats)]
+  #remove the columns that will be replaced by time scaled data
+  x <- x[ , -which(names(x) %in% stats.timenormal.headers)]
+  x.cv <- x.cv[ , -which(names(x.cv) %in% stats.timenormal.headers)]
+  #combine raw stats with time scaled stats
+  x <- data.frame(x,stats.player.year.timenormal)
+  x.cv <- data.frame(x.cv,player.stats.timenormal)
+  
+  # x = mutate_all(x, function(x) as.numeric(as.character(x)))
+  
+  #get response data
+  y <- data.frame(stats.player.year$POSITION)
+  y.cv <- data.frame(player.stats$POSITION)
+  
+  if (binary==TRUE) {
+    #Center
+    if (position==5) {
+      y[y == positions[2,]] <- 1
+      
+      y.cv[y.cv == positions[2,]] <- 1
+    }
+    #Center-Forward and Forward-Center
+    if (position==4) {
+      y[y == positions[3,]] <- 1
+      y[y == positions[5,]] <- 1
+      
+      y.cv[y.cv == positions[3,]] <- 1
+      y.cv[y.cv == positions[5,]] <- 1
+    }
+    #Forward and Forward-Guard
+     if (position==3) {
+    y[y == positions[1,]] <- 1
+    y[y == positions[6,]] <- 1
+    
+    y.cv[y.cv == positions[1,]] <- 1
+    y.cv[y.cv == positions[6,]] <- 1
+    }
+    #Guard-Forward
+     if (position==2) {
+    y[y == positions[7,]] <- 1
+    
+    y.cv[y.cv == positions[7,]] <- 1
+    }  
+    #Guard
+     if (position==1) {
+    y[y == positions[4,]] <- 1
+    
+    y.cv[y.cv == positions[4,]] <- 1
+    }  
+    
+    #set others to 0
+    y[y != 1] <- 0
+    y.cv[y.cv != 1] <- 0
+    
+    y <- mutate_all(y, function(x) as.numeric(as.character(x)))
+    y.cv <- mutate_all(y.cv, function(x) as.numeric(as.character(x)))
+    
+  }
+  
+  if (binary==FALSE) {
+    if(threeclass==TRUE){
+      y[y == positions[3,]] <- "Center"
+      y[y == positions[5,]] <- "Forward"
+      y[y == positions[6,]] <- "Forward"
+      y[y == positions[7,]] <- "Guard"
+      
+      y.cv[y.cv == positions[3,]] <- "Center"
+      y.cv[y.cv == positions[5,]] <- "Forward"
+      y.cv[y.cv == positions[6,]] <- "Forward"
+      y.cv[y.cv == positions[7,]] <- "Guard"
+    }
+    y[y == positions[3,]] <- "CenterForward"
+    y[y == positions[5,]] <- "ForwardCenter"
+    y[y == positions[6,]] <- "ForwardGuard"
+    y[y == positions[7,]] <- "GuardForward"
+    
+    y.cv[y.cv == positions[3,]] <- "CenterForward"
+    y.cv[y.cv == positions[5,]] <- "ForwardCenter"
+    y.cv[y.cv == positions[6,]] <- "ForwardGuard"
+    y.cv[y.cv == positions[7,]] <- "GuardForward"
+  }
+
+  
+################################################
+# UNCOMMENT IF WANT ONLY STANDARD BOXSCORE DATA#
+################################################
+# standard.boxscore.headers <- c("FGA","FGM","FG3M","FG3A","FTM","FTA","OREB","DREB","REB","AST","STL","BLK","TOV","PF","PTS","PLUS_MINUS")
+# x <- x[ , which(names(x) %in% standard.boxscore.headers)]
+################################################
+  
+  out.data <- list(y,x,y.cv,x.cv)
+  
+  return(out.data)
+}
+
+
+```
+
+
+### FN: LDA sweep
+
+```{r LDA.sweep, warning=FALSE, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+
+lda.analysis <- function(player.stats, player.stats.timenormal,seasons,pos){
+
+  
+  testerr.df <- data.frame(matrix(nrow = nrow(seasons), ncol = nrow(seasons)))
+  trainerr.df <- data.frame(matrix(nrow = nrow(seasons), ncol = 2))
+  colnames(testerr.df) <- c((seasons[,1]-20000))
+  colnames(trainerr.df) <- c("trainErr","5CVErr")
+  
+  for (i in 1:nrow(seasons)) {
+    
+    #debug
+    # i=1
+    # pos=5
+    
+    
+    #training data
+    train.year <- seasons[i,]-20000
+    train = data.fn(player.stats, player.stats.timenormal, seasons,
+                    train.year,pos,TRUE,FALSE)
+    x.train = train[[2]]
+    y.train = train[[1]]
+    
+    #LDA
+    train.lda <- lda(as.matrix(y.train)~.,x.train)
+    
+    #5 fold CV
+    data = data.frame(y.train,x.train)
+    train.lda.cv <- LinearDA(data,1,nTrainFolds = 5, silent = TRUE)
+    trainerr.df[i,2] <- (1-train.lda.cv)
+    
+    #training error rate
+    yhat.LDA.train <- predict(train.lda, x.train)$class
+    err.train.LDA <- mean(data.frame(yhat.LDA.train) != y.train)
+    trainerr.df[i,1] <- err.train.LDA
+    
+    #initialize test loop list
+    # seasons.test = data.frame(seasons[-i,])
+    
+    for (j in 1:nrow(seasons)) {
+      if (i==j) {
+        next
+      }
+      #debug
+      # j=7
+      
+      test.year <- seasons[j,]-20000
+      
+      test = data.fn(player.stats, player.stats.timenormal, seasons,
+                     test.year,pos,TRUE,FALSE)
+
+      x.test = test[[2]]
+      y.test = test[[1]]
+      
+      #test error rate
+      yhat.LDA.test <- predict(train.lda, x.test)$class
+      err.test.LDA <- mean(data.frame(yhat.LDA.test) != y.test)
+      testerr.df[j,i] <- err.test.LDA
+      
+    }
+    
+    
+  }
+  
+  
+  return(list(trainerr.df,testerr.df))
+
+}
+
+
+```
+
+### FN: GLM Logistic Regression sweep
+
+```{r glm.sweep, warning=FALSE, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+
+glm.analysis <- function(player.stats, player.stats.timenormal,seasons,pos){
+
+  
+  testerr.df <- data.frame(matrix(nrow = nrow(seasons), ncol = nrow(seasons)))
+  trainerr.df <- data.frame(matrix(nrow = nrow(seasons), ncol = 1))
+  glmcoef.keep <- list()
+  glmcoef.drop <- list()
+  topfive <- list()
+  colnames(testerr.df) <- c((seasons[,1]-20000))
+  colnames(trainerr.df) <- c("trainErr")
+
+  
+  
+  for (i in 1:nrow(seasons)) {
+    
+    #training data
+    train.year <- seasons[i,]-20000
+    train = data.fn(player.stats, player.stats.timenormal, seasons,
+                    train.year,pos,TRUE,FALSE)
+    x.train = train[[2]]
+    y.train = train[[1]]
+    
+    #glm  REPLACE ME
+    train.glm <- glm(as.matrix(y.train)~.,data = x.train, 
+                     family = binomial(link="logit"))
+
+    #get significant features
+    sig.coef.glm <- coef(summary(train.glm))[,4]
+    sig.coef.glm <- sig.coef.glm[-1]
+    topfive[i] <- data.frame(names(head(sort(sig.coef.glm),5)))
+    sig.coef.glm <- sig.coef.glm[which(sig.coef.glm<0.05)]
+    sig.coef.glm <- names(sig.coef.glm)
+
+    
+    #drop not significant features
+    drop.coef.glm <- coef(summary(train.glm))[,4]
+    drop.coef.glm <- drop.coef.glm[which(drop.coef.glm>=0.05)]
+    drop.coef.glm <- names(drop.coef.glm)
+    drop.coef.glm <- drop.coef.glm[-1]
+    
+    
+    glmcoef.drop[i] <- data.frame(drop.coef.glm)
+    glmcoef.keep[i] <- data.frame(sig.coef.glm)
+    
+    
+    #training error rate
+    yhat.glm.train <- predict(train.glm, x.train)
+    
+    yhat.glm.train[yhat.glm.train<0] <- 0
+    yhat.glm.train[yhat.glm.train>0] <- 1
+    
+    err.train.glm <- mean(data.frame(yhat.glm.train) != y.train)
+    trainerr.df[i,1] <- err.train.glm
+    
+    #initialize test loop list
+    # seasons.test = data.frame(seasons[-i,])
+    
+    for (j in 1:nrow(seasons)) {
+      if (i==j) {
+        next
+      }
+      #debug
+      # j=7
+      
+      test.year <- seasons[j,]-20000
+      
+      test = data.fn(player.stats, player.stats.timenormal, seasons,
+                     test.year,pos,TRUE,FALSE)
+
+      x.test = test[[2]]
+      y.test = test[[1]]
+      
+      #test error rate
+      yhat.glm.test <- predict(train.glm, x.test)
+      
+      yhat.glm.test[yhat.glm.test<0] <- 0
+      yhat.glm.test[yhat.glm.test>0] <- 1
+      
+      err.test.glm <- mean(data.frame(yhat.glm.test) != y.test)
+      testerr.df[j,i] <- err.test.glm
+      
+    }
+    
+    
+  }
+  
+  
+  return(list(trainerr.df,testerr.df,glmcoef.drop,glmcoef.keep,topfive))
+
+}
+
+
+```
+
+### FN: GLM Feature Selection, GLM and LDA rerun
+
+```{r fs.glm.LDA.sweep, warning=FALSE, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+
+fs.analysis <- function(player.stats, player.stats.timenormal,seasons,pos){
+
+  
+  lda.testerr.df <- data.frame(matrix(nrow = nrow(seasons), ncol = nrow(seasons)))
+  glm.testerr.df <- data.frame(matrix(nrow = nrow(seasons), ncol = nrow(seasons)))
+  trainerr.df <- data.frame(matrix(nrow = nrow(seasons), ncol = 3))
+  comp.times <- data.frame(matrix(nrow = nrow(seasons), ncol = 4))
+  glmcoef.keep <- list()
+  glmcoef.drop <- list()
+  topfive <- list()
+  featurestats <- data.frame(matrix(nrow = nrow(seasons), ncol = 2))
+  
+  colnames(lda.testerr.df) <- c((seasons[,1]-20000))
+  colnames(glm.testerr.df) <- c((seasons[,1]-20000))
+  colnames(trainerr.df) <- c("ldaTrainErr","5CVErr","glmTrainErr")
+  colnames(featurestats) <- c("featuresDropped","featuresRetained")
+  colnames(comp.times) <- c("glmAllFeatures","glmSigFeatures",
+                            "ldaAllFeatures","ldaSigFeatures")
+  
+  for (i in 1:nrow(seasons)) {
+    
+    #training data
+    train.year <- seasons[i,]-20000
+    train = data.fn(player.stats, player.stats.timenormal, seasons,
+                    train.year,pos,TRUE,FALSE)
+    x.train = train[[2]]
+    y.train = train[[1]]
+    
+    #fit GLM for variable selection
+    
+    start.time <- Sys.time()
+    train.glm <- glm(as.matrix(y.train)~.,data = x.train, 
+                     family = binomial(link="logit"))
+    end.time <- Sys.time()
+    comp.times[i,1] <- end.time - start.time
+    
+    #get original LDA fit time
+    start.time <- Sys.time()
+    train.lda <- lda(as.matrix(y.train)~.,x.train)
+    end.time <- Sys.time()
+    comp.times[i,3] <- end.time - start.time
+
+    
+    #get significant features
+    sig.coef.glm <- coef(summary(train.glm))[,4]
+    sig.coef.glm <- sig.coef.glm[-1]
+    topfive[i] <- data.frame(names(head(sort(sig.coef.glm),5)))
+    sig.coef.glm <- sig.coef.glm[which(sig.coef.glm<0.05)]
+    sig.coef.glm <- names(sig.coef.glm)
+
+    
+    #drop not significant features
+    drop.coef.glm <- coef(summary(train.glm))[,4]
+    drop.coef.glm <- drop.coef.glm[which(drop.coef.glm>=0.05)]
+    drop.coef.glm <- names(drop.coef.glm)
+    drop.coef.glm <- drop.coef.glm[-1]
+    featurestats[i,1] <- length(drop.coef.glm)
+    
+ #old method here
+    
+    glmcoef.drop[i] <- data.frame(drop.coef.glm)
+    glmcoef.keep[i] <- data.frame(sig.coef.glm)
+    featurestats[i,2] <- nrow(data.frame(sig.coef.glm))
+
+    
+    #keep only significant terms from glm
+    x.train <- x.train[ , which(names(x.train) %in% sig.coef.glm)]
+    
+    #LDA
+    start.time <- Sys.time()
+    train.lda <- lda(as.matrix(y.train)~.,x.train)
+    end.time <- Sys.time()
+    comp.times[i,4] <- end.time - start.time
+    
+    #Logistic Regression Refit
+    start.time <- Sys.time()
+    train.glm <- glm(as.matrix(y.train)~.,data = x.train, 
+                     family = binomial(link="logit"))
+    end.time <- Sys.time()
+    comp.times[i,2] <- end.time - start.time
+    
+    #5 fold CV
+    data = data.frame(y.train,x.train)
+    train.lda.cv <- LinearDA(data,1,nTrainFolds = 5, silent = TRUE)
+    trainerr.df[i,2] <- (1-train.lda.cv)
+    
+    
+    #LDA training error rate
+    yhat.LDA.train <- predict(train.lda, x.train)$class
+    err.train.LDA <- mean(data.frame(yhat.LDA.train) != y.train)
+    trainerr.df[i,1] <- err.train.LDA
+    
+    #GLM training error rate
+    yhat.glm.train <- predict(train.glm, x.train)
+    
+    yhat.glm.train[yhat.glm.train<0] <- 0
+    yhat.glm.train[yhat.glm.train>0] <- 1
+    
+    err.train.glm <- mean(data.frame(yhat.glm.train) != y.train)
+    trainerr.df[i,3] <- err.train.glm
+    
+    #initialize test loop list
+    # seasons.test = data.frame(seasons[-i,])
+    
+    for (j in 1:nrow(seasons)) {
+      if (i==j) {
+        next
+      }
+      #debug
+      # j=7
+      
+      test.year <- seasons[j,]-20000
+      
+      test = data.fn(player.stats, player.stats.timenormal, seasons,
+                     test.year,pos,TRUE,FALSE)
+
+      x.test = test[[2]]
+      y.test = test[[1]]
+      
+      #keep only significant terms from glm
+      x.test <- x.test[ , which(names(x.test) %in% sig.coef.glm)]
+      
+      #lda test error rate
+      yhat.LDA.test <- predict(train.lda, x.test)$class
+      err.test.LDA <- mean(data.frame(yhat.LDA.test) != y.test)
+      lda.testerr.df[j,i] <- err.test.LDA
+      
+      #glm test error rate
+      yhat.glm.test <- predict(train.glm, x.test)
+      
+      yhat.glm.test[yhat.glm.test<0] <- 0
+      yhat.glm.test[yhat.glm.test>0] <- 1
+      
+      err.test.glm <- mean(data.frame(yhat.glm.test) != y.test)
+      glm.testerr.df[j,i] <- err.test.glm
+      
+    }
+    
+    
+  }
+  
+  
+  return(list(trainerr.df,lda.testerr.df,glmcoef.drop,glmcoef.keep,topfive,featurestats,glm.testerr.df,comp.times))
+
+}
+
+
+```
+
+### FN: AIC and BIC Selection
+
+```{r glmVS.LDA.sweep, warning=FALSE, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+
+ic.analysis <- function(player.stats, player.stats.timenormal,seasons,pos){
+
+  AIC <- list()
+  BIC <- list()
+  AIC.names <- list()
+  BIC.names <- list()
+  featurestats <- data.frame(matrix(nrow = nrow(seasons), ncol = 2))
+  comp.times <- data.frame(matrix(nrow = nrow(seasons), ncol = 4))
+
+  colnames(comp.times) <- c("glmAIC","glmBIC",
+                            "ldaAIC","ldaBIC")
+  colnames(featurestats) <- c("nAIC","nBIC")
+  
+  for (i in 1:nrow(seasons)) {
+    
+    #training data
+    train.year <- seasons[i,]-20000
+    train = data.fn(player.stats, player.stats.timenormal, seasons,
+                    train.year,pos,TRUE,FALSE)
+    x.train = train[[2]]
+    y.train = train[[1]]
+    
+    #fit GLM for variable selection
+    train.glm <- glm(as.matrix(y.train)~.,data = x.train, 
+                     family = binomial(link="logit"))
+    
+    #get significant features
+    sig.coef.glm <- coef(summary(train.glm))[,4]
+    sig.coef.glm <- sig.coef.glm[-1]
+    sig.coef.glm <- sig.coef.glm[which(sig.coef.glm<0.05)]
+    sig.coef.glm <- names(sig.coef.glm)
+
+    
+    #keep only significant terms from glm
+    x.train <- x.train[ , which(names(x.train) %in% sig.coef.glm)]
+    
+    #AIC and BIC
+    Xy = data.frame(x.train,y.train)
+    AIC[i] <- bestglm(Xy, IC="AIC")
+    BIC[i] <- bestglm(Xy, IC="BIC")
+    
+    #keep only AIC terms
+    x.train.AIC <- x.train[ , which(names(x.train) %in%
+                                      names(AIC[[i]]$coefficients[-1]))]
+    x.train.BIC <- x.train[ , which(names(x.train) %in%
+                                      names(BIC[[i]]$coefficients[-1]))]
+    
+    #GLM time
+    
+    start.time <- Sys.time()
+    train.glm <- glm(as.matrix(y.train)~.,data = x.train.AIC, 
+                     family = binomial(link="logit"))
+    end.time <- Sys.time()
+    comp.times[i,1] <- end.time - start.time
+    
+    start.time <- Sys.time()
+    train.glm <- glm(as.matrix(y.train)~.,data = x.train.BIC, 
+                     family = binomial(link="logit"))
+    end.time <- Sys.time()
+    comp.times[i,2] <- end.time - start.time
+    
+    # LDA fit time
+    start.time <- Sys.time()
+    train.lda <- lda(as.matrix(y.train)~.,x.train.AIC)
+    end.time <- Sys.time()
+    comp.times[i,3] <- end.time - start.time
+    
+    start.time <- Sys.time()
+    train.lda <- lda(as.matrix(y.train)~.,x.train.AIC)
+    end.time <- Sys.time()
+    comp.times[i,4] <- end.time - start.time
+    
+    
+
+  }
+  
+  
+  return(list(AIC,BIC,comp.times))
+
+}
+
+
+```
+
+## ** FN: AIC BIC rerun **MUST RUN ic.analysis first! USE SAME 'pos'!
+
+```{r fs.glm.LDA.sweep, warning=FALSE, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+
+fs.ic.analysis <- function(player.stats, player.stats.timenormal,seasons,pos,AIC.coef,BIC.coef){
+
+  
+  lda.testerr.df.AIC <- data.frame(matrix(nrow = nrow(seasons), ncol = nrow(seasons)))
+  lda.testerr.df.BIC <- data.frame(matrix(nrow = nrow(seasons), ncol = nrow(seasons)))
+  
+  glm.testerr.df.AIC <- data.frame(matrix(nrow = nrow(seasons), ncol = nrow(seasons)))
+  glm.testerr.df.BIC <- data.frame(matrix(nrow = nrow(seasons), ncol = nrow(seasons)))
+  trainerr.df <- data.frame(matrix(nrow = nrow(seasons), ncol = 4))
+
+  
+  colnames(lda.testerr.df.AIC) <- c((seasons[,1]-20000))
+  colnames(lda.testerr.df.BIC) <- c((seasons[,1]-20000))
+  colnames(glm.testerr.df.AIC) <- c((seasons[,1]-20000))
+  colnames(glm.testerr.df.BIC) <- c((seasons[,1]-20000))
+  colnames(trainerr.df) <- c("ldaTrainErrAIC","ldaTrainErrBIC","glmTrainErrAIC","glmTrainErrBIC")
+
+  
+  for (i in 1:nrow(seasons)) {
+    
+    #training data
+    train.year <- seasons[i,]-20000
+    train = data.fn(player.stats, player.stats.timenormal, seasons,
+                    train.year,pos,TRUE,FALSE)
+    x.train = train[[2]]
+    y.train = train[[1]]
+
+    
+    #keep only significant terms from glm
+    x.train.AIC <- x.train[ , which(names(x.train) %in% AIC.coef[[i]])]
+    x.train.BIC <- x.train[ , which(names(x.train) %in% BIC.coef[[i]])]
+    
+    #LDA
+    train.lda.AIC <- lda(as.matrix(y.train)~.,x.train.AIC)
+    train.lda.BIC <- lda(as.matrix(y.train)~.,x.train.BIC)
+    
+    #Logistic Regression Refit
+    train.glm.AIC <- glm(as.matrix(y.train)~.,data = x.train.AIC, 
+                     family = binomial(link="logit"))
+    train.glm.BIC <- glm(as.matrix(y.train)~.,data = x.train.BIC, 
+                     family = binomial(link="logit"))
+    
+    
+    #LDA training error rate
+    yhat.LDA.train.AIC <- predict(train.lda.AIC, x.train.AIC)$class
+    err.train.LDA.AIC <- mean(data.frame(yhat.LDA.train.AIC) != y.train)
+    trainerr.df[i,1] <- err.train.LDA.AIC
+    
+    yhat.LDA.train.BIC <- predict(train.lda.BIC, x.train.BIC)$class
+    err.train.LDA.BIC <- mean(data.frame(yhat.LDA.train.AIC) != y.train)
+    trainerr.df[i,2] <- err.train.LDA.BIC
+    
+    #GLM training error rate
+    yhat.glm.train.AIC <- predict(train.glm.AIC, x.train.AIC)
+    yhat.glm.train.BIC <- predict(train.glm.BIC, x.train.BIC)
+        
+    yhat.glm.train.AIC[yhat.glm.train.AIC<0] <- 0
+    yhat.glm.train.AIC[yhat.glm.train.AIC>0] <- 1
+    
+    yhat.glm.train.BIC[yhat.glm.train.BIC<0] <- 0
+    yhat.glm.train.BIC[yhat.glm.train.BIC>0] <- 1
+    
+    err.train.glm.AIC <- mean(data.frame(yhat.glm.train.AIC) != y.train)
+    err.train.glm.BIC <- mean(data.frame(yhat.glm.train.BIC) != y.train)
+    trainerr.df[i,3] <- err.train.glm.AIC
+    trainerr.df[i,4] <- err.train.glm.BIC
+    
+    #initialize test loop list
+    # seasons.test = data.frame(seasons[-i,])
+    
+    for (j in 1:nrow(seasons)) {
+      if (i==j) {
+        next
+      }
+      #debug
+      # j=7
+      
+      test.year <- seasons[j,]-20000
+      
+      test = data.fn(player.stats, player.stats.timenormal, seasons,
+                     test.year,pos,TRUE,FALSE)
+
+      x.test = test[[2]]
+      y.test = test[[1]]
+      
+      #keep only significant terms from glm
+      x.test.AIC <- x.test[ , which(names(x.test) %in% AIC.coef[[i]])]
+      x.test.BIC <- x.test[ , which(names(x.test) %in% BIC.coef[[i]])]
+      
+      #lda test error rate
+      yhat.LDA.test.AIC <- predict(train.lda.AIC, x.test.AIC)$class
+      err.test.LDA.AIC <- mean(data.frame(yhat.LDA.test.AIC) != y.test)
+      lda.testerr.df.AIC[j,i] <- err.test.LDA.AIC
+      
+      yhat.LDA.test.BIC <- predict(train.lda.BIC, x.test.BIC)$class
+      err.test.LDA.BIC <- mean(data.frame(yhat.LDA.test.BIC) != y.test)
+      lda.testerr.df.BIC[j,i] <- err.test.LDA.BIC
+      
+      
+      #glm test error rate
+      yhat.glm.test.AIC <- predict(train.glm.AIC, x.test.AIC)
+      
+      yhat.glm.test.AIC[yhat.glm.test.AIC<0] <- 0
+      yhat.glm.test.AIC[yhat.glm.test.AIC>0] <- 1
+      
+      err.test.glm.AIC <- mean(data.frame(yhat.glm.test.AIC) != y.test)
+      glm.testerr.df.AIC[j,i] <- err.test.glm.AIC
+      
+
+      
+      yhat.glm.test.BIC <- predict(train.glm.BIC, x.test.BIC)
+      
+      yhat.glm.test.BIC[yhat.glm.test.BIC<0] <- 0
+      yhat.glm.test.BIC[yhat.glm.test.BIC>0] <- 1
+      
+      err.test.glm.BIC <- mean(data.frame(yhat.glm.test.BIC) != y.test)
+      glm.testerr.df.BIC[j,i] <- err.test.glm.BIC
+      
+    }
+    
+    
+  }
+  
+  
+  return(list(trainerr.df,lda.testerr.df.AIC,lda.testerr.df.BIC,glm.testerr.df.AIC,glm.testerr.df.BIC))
+
+}
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Compare methods
+
+
+```{r compare.analysis, warning=FALSE, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+pos = 5
+
+data.lda.analysis <- lda.analysis(player.stats, player.stats.timenormal,seasons,pos)
+
+data.glm.analysis <- glm.analysis(player.stats,player.stats.timenormal,
+                                 seasons,pos)
+
+data.fs.analysis <- fs.analysis(player.stats,player.stats.timenormal,
+                                             seasons,pos)
+
+#pg
+if (pos == 1) {
+  write.csv(data.frame(data.lda.analysis[[1]],data.lda.analysis[[2]]),
+            "C:/Users/Alex Salce/OneDrive/Desktop/School/Courses/2023 FALL SDS MS/MATH574M STATISTICAL MACHINE LEARNING/Final Project/Final Project R/data/results/pg/pgdataLDA.csv", row.names=FALSE)
+  
+
+  write.csv(data.frame(data.glm.analysis[[1]],data.glm.analysis[[2]],
+                       paste(data.glm.analysis[[3]])),
+            "C:/Users/Alex Salce/OneDrive/Desktop/School/Courses/2023 FALL SDS MS/MATH574M STATISTICAL MACHINE LEARNING/Final Project/Final Project R/data/results/pg/pgdataGLM.csv", row.names=FALSE)
+  
+  write.csv(data.frame(data.fs.analysis[[1]],data.fs.analysis[[2]],
+                       paste(data.fs.analysis[[3]]),
+                       paste(data.fs.analysis[[4]]),
+                       paste(data.fs.analysis[[5]]),
+                       data.fs.analysis[[6]]),
+            "C:/Users/Alex Salce/OneDrive/Desktop/School/Courses/2023 FALL SDS MS/MATH574M STATISTICAL MACHINE LEARNING/Final Project/Final Project R/data/results/pg/pgdataGLMfsLDA.csv", row.names=FALSE)
+  
+  lda.glm.compare = data.lda.analysis[[2]] - data.glm.analysis[[2]]
+  lda.fs.compare = data.lda.analysis[[2]] - data.fs.analysis[[2]]
+    write.csv(data.frame(lda.glm.compare,lda.fs.compare,paste(data.fs.analysis[[3]])),
+            "C:/Users/Alex Salce/OneDrive/Desktop/School/Courses/2023 FALL SDS MS/MATH574M STATISTICAL MACHINE LEARNING/Final Project/Final Project R/data/results/pg/pgcompare.csv", row.names=FALSE)
+  
+}
+
+#sg
+if (pos == 2) {
+  write.csv(data.frame(data.lda.analysis[[1]],data.lda.analysis[[2]]),
+            "C:/Users/Alex Salce/OneDrive/Desktop/School/Courses/2023 FALL SDS MS/MATH574M STATISTICAL MACHINE LEARNING/Final Project/Final Project R/data/results/sg/sgdataLDA.csv", row.names=FALSE)
+  
+
+  write.csv(data.frame(data.glm.analysis[[1]],data.glm.analysis[[2]],
+                       paste(data.glm.analysis[[3]])),
+            "C:/Users/Alex Salce/OneDrive/Desktop/School/Courses/2023 FALL SDS MS/MATH574M STATISTICAL MACHINE LEARNING/Final Project/Final Project R/data/results/sg/sgdataGLM.csv", row.names=FALSE)
+  
+  write.csv(data.frame(data.fs.analysis[[1]],data.fs.analysis[[2]],
+                       paste(data.fs.analysis[[3]]),
+                       paste(data.fs.analysis[[4]]),
+                       paste(data.fs.analysis[[5]]),
+                       data.fs.analysis[[6]]),
+            "C:/Users/Alex Salce/OneDrive/Desktop/School/Courses/2023 FALL SDS MS/MATH574M STATISTICAL MACHINE LEARNING/Final Project/Final Project R/data/results/sg/sgdataGLMfsLDA.csv", row.names=FALSE)
+  
+  lda.glm.compare = data.lda.analysis[[2]] - data.glm.analysis[[2]]
+  lda.fs.compare = data.lda.analysis[[2]] - data.fs.analysis[[2]]
+    write.csv(data.frame(lda.glm.compare,lda.fs.compare,paste(data.fs.analysis[[3]])),
+            "C:/Users/Alex Salce/OneDrive/Desktop/School/Courses/2023 FALL SDS MS/MATH574M STATISTICAL MACHINE LEARNING/Final Project/Final Project R/data/results/sg/sgcompare.csv", row.names=FALSE)
+  
+}
+
+#sf
+if (pos == 3) {
+  write.csv(data.frame(data.lda.analysis[[1]],data.lda.analysis[[2]]),
+            "C:/Users/Alex Salce/OneDrive/Desktop/School/Courses/2023 FALL SDS MS/MATH574M STATISTICAL MACHINE LEARNING/Final Project/Final Project R/data/results/sf/sfdataLDA.csv", row.names=FALSE)
+  
+
+  write.csv(data.frame(data.glm.analysis[[1]],data.glm.analysis[[2]],
+                       paste(data.glm.analysis[[3]])),
+            "C:/Users/Alex Salce/OneDrive/Desktop/School/Courses/2023 FALL SDS MS/MATH574M STATISTICAL MACHINE LEARNING/Final Project/Final Project R/data/results/sf/sfdataGLM.csv", row.names=FALSE)
+  
+  write.csv(data.frame(data.fs.analysis[[1]],data.fs.analysis[[2]],
+                       paste(data.fs.analysis[[3]]),
+                       paste(data.fs.analysis[[4]]),
+                       paste(data.fs.analysis[[5]]),
+                       data.fs.analysis[[6]]),
+            "C:/Users/Alex Salce/OneDrive/Desktop/School/Courses/2023 FALL SDS MS/MATH574M STATISTICAL MACHINE LEARNING/Final Project/Final Project R/data/results/sf/sfdataGLMfsLDA.csv", row.names=FALSE)
+  
+  lda.glm.compare = data.lda.analysis[[2]] - data.glm.analysis[[2]]
+  lda.fs.compare = data.lda.analysis[[2]] - data.fs.analysis[[2]]
+    write.csv(data.frame(lda.glm.compare,lda.fs.compare,paste(data.fs.analysis[[3]])),
+            "C:/Users/Alex Salce/OneDrive/Desktop/School/Courses/2023 FALL SDS MS/MATH574M STATISTICAL MACHINE LEARNING/Final Project/Final Project R/data/results/sf/sfcompare.csv", row.names=FALSE)
+  
+}
+
+#pf
+if (pos == 4) {
+  write.csv(data.frame(data.lda.analysis[[1]],data.lda.analysis[[2]]),
+            "C:/Users/Alex Salce/OneDrive/Desktop/School/Courses/2023 FALL SDS MS/MATH574M STATISTICAL MACHINE LEARNING/Final Project/Final Project R/data/results/pf/pfdataLDA.csv", row.names=FALSE)
+  
+
+  write.csv(data.frame(data.glm.analysis[[1]],data.glm.analysis[[2]],
+                       paste(data.glm.analysis[[3]])),
+            "C:/Users/Alex Salce/OneDrive/Desktop/School/Courses/2023 FALL SDS MS/MATH574M STATISTICAL MACHINE LEARNING/Final Project/Final Project R/data/results/pf/pfdataGLM.csv", row.names=FALSE)
+  
+  write.csv(data.frame(data.fs.analysis[[1]],data.fs.analysis[[2]],
+                       paste(data.fs.analysis[[3]]),
+                       paste(data.fs.analysis[[4]]),
+                       paste(data.fs.analysis[[5]]),
+                       data.fs.analysis[[6]]),
+            "C:/Users/Alex Salce/OneDrive/Desktop/School/Courses/2023 FALL SDS MS/MATH574M STATISTICAL MACHINE LEARNING/Final Project/Final Project R/data/results/pf/pfdataGLMfsLDA.csv", row.names=FALSE)
+  
+  lda.glm.compare = data.lda.analysis[[2]] - data.glm.analysis[[2]]
+  lda.fs.compare = data.lda.analysis[[2]] - data.fs.analysis[[2]]
+    write.csv(data.frame(lda.glm.compare,lda.fs.compare,paste(data.fs.analysis[[3]])),
+            "C:/Users/Alex Salce/OneDrive/Desktop/School/Courses/2023 FALL SDS MS/MATH574M STATISTICAL MACHINE LEARNING/Final Project/Final Project R/data/results/pf/pfcompare.csv", row.names=FALSE)
+  
+}
+
+#c
+if (pos == 5) {
+  write.csv(data.frame(data.lda.analysis[[1]],data.lda.analysis[[2]]),
+            "C:/Users/Alex Salce/OneDrive/Desktop/School/Courses/2023 FALL SDS MS/MATH574M STATISTICAL MACHINE LEARNING/Final Project/Final Project R/data/results/c/cdataLDA.csv", row.names=FALSE)
+  
+
+  write.csv(data.frame(data.glm.analysis[[1]],data.glm.analysis[[2]],
+                       paste(data.glm.analysis[[3]])),
+            "C:/Users/Alex Salce/OneDrive/Desktop/School/Courses/2023 FALL SDS MS/MATH574M STATISTICAL MACHINE LEARNING/Final Project/Final Project R/data/results/c/cdataGLM.csv", row.names=FALSE)
+  
+  write.csv(data.frame(data.fs.analysis[[1]],data.fs.analysis[[2]],
+                       paste(data.fs.analysis[[3]]),
+                       paste(data.fs.analysis[[4]]),
+                       paste(data.fs.analysis[[5]]),
+                       data.fs.analysis[[6]]),
+            "C:/Users/Alex Salce/OneDrive/Desktop/School/Courses/2023 FALL SDS MS/MATH574M STATISTICAL MACHINE LEARNING/Final Project/Final Project R/data/results/c/cdataGLMfsLDA.csv", row.names=FALSE)
+  
+  lda.glm.compare = data.lda.analysis[[2]] - data.glm.analysis[[2]]
+  lda.fs.compare = data.lda.analysis[[2]] - data.fs.analysis[[2]]
+    write.csv(data.frame(lda.glm.compare,lda.fs.compare,paste(data.fs.analysis[[3]])),
+            "C:/Users/Alex Salce/OneDrive/Desktop/School/Courses/2023 FALL SDS MS/MATH574M STATISTICAL MACHINE LEARNING/Final Project/Final Project R/data/results/c/ccompare.csv", row.names=FALSE)
+  
+}
+
+rm(lda.glm.compare, lda.fs.compare)
+
+```
+
+
+
+```{r AICBIC, warning=FALSE, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+pos = 5
+
+start.time <- Sys.time()
+data.ic.analysis <- ic.analysis(player.stats, player.stats.timenormal,seasons,pos)
+end.time <- Sys.time()
+time.taken <- end.time - start.time
+
+rm(start.time,end.time)
+
+
+AIC.coef <- list()
+nAIC <- list()
+BIC.coef <- list()
+nBIC <- list()
+
+for (i in 1:length(data.ic.analysis[[1]])) {
+  AIC.coef[i] <- data.frame(names(data.ic.analysis[[1]][[i]]$coefficients)[-1])
+  BIC.coef[i] <- data.frame(names(data.ic.analysis[[2]][[i]]$coefficients)[-1])
+  nAIC[i] <- length(names(data.ic.analysis[[1]][[i]]$coefficients)[-1])
+  nBIC[i] <- length(names(data.ic.analysis[[2]][[i]]$coefficients)[-1])
+}
+
+
+
+if (pos == 1) {
+  write.csv(data.frame(paste(AIC.coef),paste(BIC.coef),paste(nAIC),paste(nBIC),
+                       data.ic.analysis[[3]]),
+            "C:/Users/Alex Salce/OneDrive/Desktop/School/Courses/2023 FALL SDS MS/MATH574M STATISTICAL MACHINE LEARNING/Final Project/Final Project R/data/results/pg/pg_ic.csv", row.names=FALSE)
+}
+
+if (pos == 2) {
+  write.csv(data.frame(paste(AIC.coef),paste(BIC.coef),paste(nAIC),paste(nBIC),
+                       data.ic.analysis[[3]]),
+            "C:/Users/Alex Salce/OneDrive/Desktop/School/Courses/2023 FALL SDS MS/MATH574M STATISTICAL MACHINE LEARNING/Final Project/Final Project R/data/results/sg/sg_ic.csv", row.names=FALSE)
+}
+
+if (pos == 3) {
+  write.csv(data.frame(paste(AIC.coef),paste(BIC.coef),paste(nAIC),paste(nBIC),
+                       data.ic.analysis[[3]]),
+            "C:/Users/Alex Salce/OneDrive/Desktop/School/Courses/2023 FALL SDS MS/MATH574M STATISTICAL MACHINE LEARNING/Final Project/Final Project R/data/results/sf/sf_ic.csv", row.names=FALSE)
+}
+
+if (pos == 4) {
+  write.csv(data.frame(paste(AIC.coef),paste(BIC.coef),paste(nAIC),paste(nBIC),
+                       data.ic.analysis[[3]]),
+            "C:/Users/Alex Salce/OneDrive/Desktop/School/Courses/2023 FALL SDS MS/MATH574M STATISTICAL MACHINE LEARNING/Final Project/Final Project R/data/results/pf/pf_ic.csv", row.names=FALSE)
+}
+
+if (pos == 5) {
+  write.csv(data.frame(paste(AIC.coef),paste(BIC.coef),paste(nAIC),paste(nBIC),
+                       data.ic.analysis[[3]]),
+            "C:/Users/Alex Salce/OneDrive/Desktop/School/Courses/2023 FALL SDS MS/MATH574M STATISTICAL MACHINE LEARNING/Final Project/Final Project R/data/results/c/c_ic.csv", row.names=FALSE)
+}
+
+beep()
+```
+
+
+
+## FS ONLY Compare methods
+
+
+```{r compare.analysis, warning=FALSE, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+pos = 5
+
+data.fs.analysis <- fs.analysis(player.stats,player.stats.timenormal,
+                                             seasons,pos)
+
+#pg
+if (pos == 1) {
+  
+  write.csv(data.frame(data.fs.analysis[[1]],data.fs.analysis[[2]],
+                       paste(data.fs.analysis[[3]]),
+                       paste(data.fs.analysis[[4]]),
+                       paste(data.fs.analysis[[5]]),
+                       data.fs.analysis[[6]],
+                       data.fs.analysis[[7]],
+                       data.fs.analysis[[8]]),
+            "C:/Users/Alex Salce/OneDrive/Desktop/School/Courses/2023 FALL SDS MS/MATH574M STATISTICAL MACHINE LEARNING/Final Project/Final Project R/data/results/pg/pgdataGLMfsLDA.csv", row.names=FALSE)
+  
+}
+
+#sg
+if (pos == 2) {
+  
+  write.csv(data.frame(data.fs.analysis[[1]],data.fs.analysis[[2]],
+                       paste(data.fs.analysis[[3]]),
+                       paste(data.fs.analysis[[4]]),
+                       paste(data.fs.analysis[[5]]),
+                       data.fs.analysis[[6]],
+                       data.fs.analysis[[7]],
+                       data.fs.analysis[[8]]),
+            "C:/Users/Alex Salce/OneDrive/Desktop/School/Courses/2023 FALL SDS MS/MATH574M STATISTICAL MACHINE LEARNING/Final Project/Final Project R/data/results/sg/sgdataGLMfsLDA.csv", row.names=FALSE)
+  
+}
+
+#sf
+if (pos == 3) {
+
+  write.csv(data.frame(data.fs.analysis[[1]],data.fs.analysis[[2]],
+                       paste(data.fs.analysis[[3]]),
+                       paste(data.fs.analysis[[4]]),
+                       paste(data.fs.analysis[[5]]),
+                       data.fs.analysis[[6]],
+                       data.fs.analysis[[7]],
+                       data.fs.analysis[[8]]),
+            "C:/Users/Alex Salce/OneDrive/Desktop/School/Courses/2023 FALL SDS MS/MATH574M STATISTICAL MACHINE LEARNING/Final Project/Final Project R/data/results/sf/sfdataGLMfsLDA.csv", row.names=FALSE)
+  
+}
+
+#pf
+if (pos == 4) {
+  
+  write.csv(data.frame(data.fs.analysis[[1]],data.fs.analysis[[2]],
+                       paste(data.fs.analysis[[3]]),
+                       paste(data.fs.analysis[[4]]),
+                       paste(data.fs.analysis[[5]]),
+                       data.fs.analysis[[6]],
+                       data.fs.analysis[[7]],
+                       data.fs.analysis[[8]]),
+            "C:/Users/Alex Salce/OneDrive/Desktop/School/Courses/2023 FALL SDS MS/MATH574M STATISTICAL MACHINE LEARNING/Final Project/Final Project R/data/results/pf/pfdataGLMfsLDA.csv", row.names=FALSE)
+  
+}
+
+#c
+if (pos == 5) {
+  
+  write.csv(data.frame(data.fs.analysis[[1]],data.fs.analysis[[2]],
+                       paste(data.fs.analysis[[3]]),
+                       paste(data.fs.analysis[[4]]),
+                       paste(data.fs.analysis[[5]]),
+                       data.fs.analysis[[6]],
+                       data.fs.analysis[[7]],
+                       data.fs.analysis[[8]]),
+            "C:/Users/Alex Salce/OneDrive/Desktop/School/Courses/2023 FALL SDS MS/MATH574M STATISTICAL MACHINE LEARNING/Final Project/Final Project R/data/results/c/cdataGLMfsLDA.csv", row.names=FALSE)
+  
+
+}
+
+beep()
+
+```
+
+
+
+
+
+
+
+```{r AICBIC.err, warning=FALSE, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+#configure pos in AICBIC chunk
+
+data.fs.ic.analysis <- fs.ic.analysis(player.stats, player.stats.timenormal,seasons,pos,AIC.coef,BIC.coef)
+
+
+
+
+if (pos == 1) {
+  write.csv(data.frame(data.fs.ic.analysis[[1]],data.fs.ic.analysis[[2]],
+                       data.fs.ic.analysis[[3]],data.fs.ic.analysis[[4]],
+                       data.fs.ic.analysis[[5]]),
+            "C:/Users/Alex Salce/OneDrive/Desktop/School/Courses/2023 FALL SDS MS/MATH574M STATISTICAL MACHINE LEARNING/Final Project/Final Project R/data/results/pg/pg_ic_err.csv", row.names=FALSE)
+}
+
+if (pos == 2) {
+  write.csv(data.frame(data.fs.ic.analysis[[1]],data.fs.ic.analysis[[2]],
+                       data.fs.ic.analysis[[3]],data.fs.ic.analysis[[4]],
+                       data.fs.ic.analysis[[5]]),
+            "C:/Users/Alex Salce/OneDrive/Desktop/School/Courses/2023 FALL SDS MS/MATH574M STATISTICAL MACHINE LEARNING/Final Project/Final Project R/data/results/sg/sg_ic_err.csv", row.names=FALSE)
+}
+
+if (pos == 3) {
+  write.csv(data.frame(data.fs.ic.analysis[[1]],data.fs.ic.analysis[[2]],
+                       data.fs.ic.analysis[[3]],data.fs.ic.analysis[[4]],
+                       data.fs.ic.analysis[[5]]),
+            "C:/Users/Alex Salce/OneDrive/Desktop/School/Courses/2023 FALL SDS MS/MATH574M STATISTICAL MACHINE LEARNING/Final Project/Final Project R/data/results/sf/sf_ic_err.csv", row.names=FALSE)
+}
+
+if (pos == 4) {
+  write.csv(data.frame(data.fs.ic.analysis[[1]],data.fs.ic.analysis[[2]],
+                       data.fs.ic.analysis[[3]],data.fs.ic.analysis[[4]],
+                       data.fs.ic.analysis[[5]]),
+            "C:/Users/Alex Salce/OneDrive/Desktop/School/Courses/2023 FALL SDS MS/MATH574M STATISTICAL MACHINE LEARNING/Final Project/Final Project R/data/results/pf/pf_ic_err.csv", row.names=FALSE)
+}
+
+if (pos == 5) {
+  write.csv(data.frame(data.fs.ic.analysis[[1]],data.fs.ic.analysis[[2]],
+                       data.fs.ic.analysis[[3]],data.fs.ic.analysis[[4]],
+                       data.fs.ic.analysis[[5]]),
+            "C:/Users/Alex Salce/OneDrive/Desktop/School/Courses/2023 FALL SDS MS/MATH574M STATISTICAL MACHINE LEARNING/Final Project/Final Project R/data/results/c/c_ic_err.csv", row.names=FALSE)
+}
+
+beep()
+```
+
+
+
+
+# Debug Tools
+
+### Gen Test and Train data
+
+```{r traintestdata, warning=FALSE, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+train.year <- 2020
+test.year <- 2019
+pos <- 5
+
+train = data.fn(player.stats, player.stats.timenormal, seasons, train.year,pos,TRUE,FALSE)
+test = data.fn(player.stats, player.stats.timenormal, seasons, test.year,pos,TRUE,FALSE)
+
+x.train = train[[2]]
+y.train = train[[1]]
+
+x.test = test[[2]]
+y.test = test[[1]]
+
+################################################
+# UNCOMMENT IF WANT ONLY STANDARD BOXSCORE DATA#
+################################################
+# standard.boxscore.headers <- c("FGA","FGM","FG3M","FG3A","FTM","FTA","OREB","DREB","REB","AST","STL","BLK","TOV","PF","PTS","PLUS_MINUS")
+# x.train <- x.train[ , which(names(x.train) %in% standard.boxscore.headers)]
+# 
+# x.test <- x.test[ , which(names(x.test) %in% standard.boxscore.headers)]
+################################################
+
+
+
+x.cv = test[[4]]
+y.cv = test[[3]]
+
+rm(train.year,test.year,pos,train,test)
+
+```
+
+### Filter test and train data to standard boxscore
+
+```{r standardboxscoredata, warning=FALSE, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+
+standard.boxscore.headers <- c("FGA","FGM","FG3M","FG3A","FTM","FTA","OREB","DREB","REB","AST","STL","BLK","TOV","PF","PTS","PLUS_MINUS")
+x.train <- x.train[ , which(names(x.train) %in% standard.boxscore.headers)]
+
+x.test <- x.test[ , which(names(x.test) %in% standard.boxscore.headers)]
+
+```
+### Test and Train ~Cleanup~
+```{r rm.testtraindata, warning=FALSE, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+rm(x.train,y.train,x.test,y.test,x.cv,y.cv)
+```
+
+### Data Checks
+
+```{r LDA.train, warning=FALSE, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+
+#Check correlations
+
+cor.thresh = 0.75
+
+cor.matrix.train = cor(x.train)
+cor.matrix.test = cor(x.test)
+
+check.cor.train = subset(melt(cor.matrix.train),value>cor.thresh)
+check.cor.train = check.cor.train[-which(check.cor.train$value==1),]
+
+check.cor.test = subset(melt(cor.matrix.test),value>cor.thresh)
+check.cor.test = check.cor.train[-which(check.cor.test$value==1),]
+
+check.cor.train = check.cor.train[!duplicated(check.cor.train$value), ]
+check.cor.test = check.cor.test[!duplicated(check.cor.test$value), ]
+
+check.cor.train = check.cor.train[order(check.cor.train$value),]
+check.cor.test = check.cor.test[order(check.cor.test$value),]
+
+rm(cor.matrix.test,cor.matrix.train,cor.thresh)
+
+```
+
+
+### Test Functions
+
+#### GLM Analysis
+```{r glm.analysis, warning=FALSE, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+data.glm.analysis = glm.analysis(player.stats, player.stats.timenormal,seasons,3)
+
+```
+
+#### FS Analysis
+```{r fs.analysis, warning=FALSE, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+data.fs.analysis <- fs.analysis(player.stats, player.stats.timenormal,seasons,5)
+
+```
+
+#### LDA Train
+
+```{r LDA.train, warning=FALSE, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+#LDA
+train.lda <- lda(as.matrix(y.train)~.,x.train)
+#training error rate
+yhat.LDA.train <- predict(train.lda, x.train)$class
+err.train.LDA <- mean(data.frame(yhat.LDA.train) != y.train)
+```
+
+#### LDA Cross Validation 1
+```{r LDA.CV1, warning=FALSE, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+data = data.frame(y.cv,x.cv)
+train.lda.cv <- LinearDA(data,1,nTrainFolds = 5, extendedResults = TRUE)
+rm(data)
+```
+
+#### LDA Test
+```{r LDA.test, warning=FALSE, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+
+#test error rate
+yhat.LDA.test <- predict(train.lda, x.test)$class
+err.test.LDA <- mean(data.frame(yhat.LDA.test) != y.test)
+```
+
+
+
+```{r LDA.analysis, warning=FALSE, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+data.lda.analysis = lda.analysis(player.stats, player.stats.timenormal,seasons,3)
+
+```
+
+#### LDA ~Cleanup~
+
+```{r LDA.cleanup, echo=FALSE}
+
+#cleanup env
+rm(train.lda,yhat.LDA.train,err.train.LDA)
+rm(train.lda.cv)
+rm(yhat.LDA.test,err.test.LDA)
+rm(data.lda.analysis)
+```
+
+#### GLM Train
+
+```{r LDA.train, warning=FALSE, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+#GLM logistic regression
+train.glm <- glm(as.matrix(y.train)~.,x.train, family = binomial(link="logit"))
+#training error rate
+yhat.glm.train <- predict(train.glm, x.train)
+
+yhat.glm.train[yhat.glm.train<0] <- 0
+yhat.glm.train[yhat.glm.train>0] <- 1
+
+err.train.glm <- mean(data.frame(yhat.glm.train) != y.train)
+
+#get significant features
+sig.coef.glm <- coef(summary(train.glm))[,4]
+sig.coef.glm <- sig.coef.glm[-1]
+topfive <- head(sort(sig.coef.glm),5)
+sig.coef.glm <- sig.coef.glm[which(sig.coef.glm<0.05)]
+sig.coef.glm <- names(sig.coef.glm)
+
+
+```
+
+#### GLM Test
+```{r LDA.test, warning=FALSE, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+#test error rate
+yhat.glm.test <- predict(train.glm, x.test)
+
+yhat.glm.test[yhat.glm.test<0] <- 0
+yhat.glm.test[yhat.glm.test>0] <- 1
+
+err.test.glm <- mean(data.frame(yhat.glm.test) != y.test)
+```
+
+#### GLM ~Cleanup~
+
+```{r LDA.cleanup, echo=FALSE}
+
+#cleanup env
+rm(train.glm,yhat.glm.test,err.test.glm,sig.coef.glm,err.train.glm,
+   yhat.glm.train)
+
+```
+
